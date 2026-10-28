@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 import xml.etree.ElementTree as ET
 
+from cadgen.engine import mesh_uri
 from cadgen.sdf_validation import raise_for_validation_errors, validate_sdf_root
 from cadgen.xml_common import duplicate_values, children, display_path, local_name
 
 SDF_SUFFIX = ".sdf"
-EXTERNAL_URI_SCHEMES = {"model", "package", "http", "https", "fuel"}
 
 
 class SdfSourceError(ValueError):
@@ -298,14 +297,8 @@ def _geometry_mesh_paths(
 
 
 def _resolve_local_mesh_uri(uri: str, *, base_dir: Path) -> Path | None:
-    parsed = urlparse(uri)
-    if parsed.scheme in EXTERNAL_URI_SCHEMES:
-        return None
-    if parsed.scheme and parsed.scheme != "file":
-        return None
-    if parsed.scheme == "file":
-        return Path(unquote(parsed.path)).resolve()
-    return (base_dir / uri).resolve()
+    local = mesh_uri.local_path(uri)  # None for model://, package://, http(s)://, fuel://, ...
+    return None if local is None else (base_dir / local).resolve()
 
 
 def _raise_on_duplicates(values: list[str], *, source_path: Path, label: str) -> None:

@@ -4,9 +4,9 @@ from collections.abc import Mapping
 import math
 from pathlib import Path
 import re
-from urllib.parse import unquote, urlparse
 import xml.etree.ElementTree as ET
 
+from cadgen.engine import mesh_uri
 from cadgen.findings import FindingsReport, format_findings
 # The inertia tensor is the same physics in both formats, and this was a verbatim copy
 # of URDF's routine. Imported rather than duplicated -- a divergent eigenvalue check
@@ -577,12 +577,20 @@ def _validate_inertial(inertial_element: ET.Element, result: FindingsReport, tar
     for pose_element in children(inertial_element, "pose"):
         # Inertial pose defaults to the owning link frame (unambiguous).
         _validate_pose(pose_element, result, f"{inertial_path}/pose", targets, warn_missing_relative_to=False)
-    mass = _optional_number_child(inertial_element, "mass", result, f"{inertial_path}/mass", required=True)
+    automatic = str(inertial_element.attrib.get("auto", "false")).strip().lower()
+    if automatic not in BOOLEAN_VALUES:
+        result.add("error", "invalid_boolean", "inertial auto attribute must be boolean-like", path=inertial_path)
+    calculates_inertia = automatic in {"1", "true", "yes", "on"}
+    mass = _optional_number_child(
+        inertial_element, "mass", result, f"{inertial_path}/mass", required=not calculates_inertia,
+    )
     if mass is not None and mass <= 0:
         result.add("error", "invalid_mass", "inertial mass must be positive", path=f"{inertial_path}/mass")
 
     inertia_element = _first_child(inertial_element, "inertia")
     if inertia_element is None:
+        if calculates_inertia:
+            return
         result.add("warning", "missing_inertia_matrix", "inertial element has mass but no inertia matrix", path=inertial_path)
         return
     components: dict[str, float] = {}
@@ -739,18 +747,27 @@ def _validate_frame_cycles(
 
 
 def _validate_mesh_uri(uri: str, result: FindingsReport, base_dir: Path, uri_path: str) -> None:
-    parsed = urlparse(uri)
-    if parsed.scheme in EXTERNAL_URI_SCHEMES:
+    scheme = mesh_uri.scheme(uri)  # "C:/meshes/base.stl" is a drive path, not scheme "c"
+    if scheme in EXTERNAL_URI_SCHEMES:
         return
-    if parsed.scheme and parsed.scheme != "file":
+    local = mesh_uri.local_path(uri)
+    if local is None and scheme == "file":
         result.add(
             "warning",
-            "unresolved_mesh_uri_scheme",
-            f"mesh URI scheme {parsed.scheme!r} is not resolved by bundled validation",
+            "unresolved_mesh_uri",
+            f"mesh URI {uri!r} names a file on another host, which bundled validation does not resolve",
             path=uri_path,
         )
         return
-    mesh_path = Path(unquote(parsed.path)).resolve() if parsed.scheme == "file" else (base_dir / uri).resolve()
+    if local is None:
+        result.add(
+            "warning",
+            "unresolved_mesh_uri_scheme",
+            f"mesh URI scheme {scheme!r} is not resolved by bundled validation",
+            path=uri_path,
+        )
+        return
+    mesh_path = (base_dir / local).resolve()
     if not mesh_path.is_file():
         result.add(
             "error",
