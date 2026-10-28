@@ -506,7 +506,9 @@ class SnapshotTest(unittest.TestCase):
 
     def test_a_mesh_file_is_drawn_by_occt_as_its_document_is(self) -> None:
         """The document's GLB, STL and 3MF, read by their readers and drawn by OCCT, frame as the
-        document does: the same parts where the document has them (the STL one part of all)."""
+        document does through a worker's export source: the same parts where the document has
+        them (the STL one part of all)."""
+        from cadgen.engine import worker
         from cadgen.engine.export import translate
 
         gl()
@@ -514,7 +516,9 @@ class SnapshotTest(unittest.TestCase):
             mesh = self.folder / f"stand{suffix}"
             translate(self.document, None, mesh)
             out = self.folder / f"mesh-{suffix[1:]}.png"
-            report = snapshot(mesh, out, camera=parse_camera("iso"), size=(240, 180), daemon=False)
+            report = worker._export({"source": {"path": str(mesh)}, "destinations": [],
+                                     "draw": {"out": str(out), "camera": "iso", "width": 240, "height": 180}},
+                                    lambda _text: None)["drawn"]
             self.assertEqual((report["width"], report["height"], report["renderer"], report["kind"]),
                              (240, 180, "occt", suffix[1:]), suffix)
             self.assertEqual((report["parts"], report["instances"]), (parts, 3 if parts > 1 else 1), suffix)

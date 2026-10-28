@@ -296,6 +296,7 @@ class ClientGoneTest(unittest.TestCase):
     def worker(self, stdout: bytes, stderr: bytes):
         import io
         import queue
+        import threading
         from types import SimpleNamespace
 
         from cadgen.engine.daemon import Worker
@@ -304,6 +305,7 @@ class ClientGoneTest(unittest.TestCase):
         worker.process = SimpleNamespace(stdout=io.BytesIO(stdout), stderr=io.BytesIO(stderr))
         worker.answers, worker.asked, worker.progress = queue.Queue(), {}, None
         worker.followers = []
+        worker.stderr_tail, worker.stderr_lock = "", threading.Lock()
         worker.on_progress = lambda *_args: None
 
         def gone(_message: dict) -> None:
@@ -320,12 +322,119 @@ class ClientGoneTest(unittest.TestCase):
         self.assertIsNone(worker.answers.get_nowait(), "the worker's end, after its answer")
         self.assertIsNone(worker.sink, "the gone client's sink dropped")
         self.assertEqual(worker.progress, {"kind": "build", "stage": "names"})
+        self.assertTrue(worker.process.stdout.closed, "the reader closes its pipe at EOF")
 
     def test_its_stderr_is_read_to_the_end_when_its_client_is_gone(self) -> None:
         worker = self.worker(b"", b"a line the model printed\nanother\n")
         worker._stderr()
         self.assertIsNone(worker.sink)
-        self.assertEqual(worker.process.stderr.read(), b"", "read to its end")
+        self.assertTrue(worker.process.stderr.closed, "the reader closes its pipe at EOF")
+
+
+class WorkerFailureTest(unittest.TestCase):
+    """Real subprocess pipes: startup diagnostics, fault output and the next worker's recovery."""
+
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="worker-failure-")).resolve()
+        self.addCleanup(shutil.rmtree, self.folder, ignore_errors=True)
+
+    def test_startup_failure_keeps_the_interpreters_diagnostic(self) -> None:
+        from cadgen.engine.daemon import Worker, WorkerGone
+
+        # A real interpreter startup failure, before worker.main can send ready or any client
+        # has installed a log sink. The missing standard library used to be silently discarded.
+        with self.assertRaises(WorkerGone) as caught:
+            Worker(str(self.folder / "model.py"), {**os.environ, "PYTHONHOME": str(self.folder)})
+        self.assertIn("did not start", str(caught.exception))
+        self.assertIn("encodings", str(caught.exception))
+
+    def test_local_tracebacks_are_not_observer_facts_without_an_exit_status(self) -> None:
+        from cadgen.engine.api import EngineError, _error
+        from cadgen.engine.daemon import WORKER_STDERR
+
+        diagnostic = ('Traceback (most recent call last):\n'
+                      '  File "/private/model.py", line 7, in secret_model\n'
+                      'NameError: private model detail\n')
+        for message in ("the worker did not start", "[Errno 32] Broken pipe"):
+            with self.subTest(failure=message):
+                original = _error(EngineError(message), [], {})
+                self.assertEqual(_error(EngineError(message + WORKER_STDERR + diagnostic), [], {}), original)
+
+    def test_where_a_build_was_is_said_before_the_stderr_tail(self) -> None:
+        from types import SimpleNamespace
+
+        from cadgen.engine.daemon import WORKER_STDERR, Daemon, WorkerGone
+
+        error = WorkerGone(f"the worker for m.py exited (-11) during the build{WORKER_STDERR}Fatal Python error")
+        said = Daemon._where(error, SimpleNamespace(progress={"job": "m.py::m", "stage": "body"}))
+        head, _, tail = said.partition(WORKER_STDERR)
+        self.assertTrue(head.startswith("the worker for m.py exited (-11) during the build, at m.py::m: "), said)
+        self.assertEqual(tail, "Fatal Python error")
+
+    def test_a_build_whose_log_showed_the_stderr_says_it_once(self) -> None:
+        from cadgen.engine import api
+        from cadgen.engine.daemon import WORKER_STDERR
+
+        failed = f"the worker for m.py exited (-11) during the build{WORKER_STDERR}Fatal Python error"
+
+        def ask(_order, relay, _frames):
+            relay({"log": "Fatal Python error", "stream": "model"})
+            raise api.EngineError(failed)
+
+        script = self.folder / "m.py"
+        for log, kept in ((print, False), (None, True)):  # shown on the caller's log, or nowhere
+            with self.subTest(log=log), mock.patch.object(api, "_ask", side_effect=ask), \
+                    self.assertRaises(api.EngineError) as caught:
+                api._built(script, None, log=log and (lambda _text: None), progress=False)
+            self.assertEqual(WORKER_STDERR in str(caught.exception), kept)
+            self.assertIn("exited (-11) during the build", str(caught.exception))
+
+    def test_failed_worker_keeps_a_bounded_fault_stack_and_releases_its_slot(self) -> None:
+        from cadgen.engine import daemon
+
+        # Stand in for the kernel, leaving Worker/Pool and their pipes real. dump_traceback
+        # exercises the same stderr output as a native fault without crashing the CI machine.
+        child = '''import faulthandler, json, os, sys
+print(json.dumps({"ready": os.getpid()}), flush=True)
+for line in sys.stdin:
+    if json.loads(line)["op"] == "crash":
+        sys.stderr.write("discard-this-prefix" + "x" * 20000 + "\\n")
+        print("fault handler enabled:", faulthandler.is_enabled(), file=sys.stderr, flush=True)
+        faulthandler.dump_traceback()
+        os._exit(1)
+    print(json.dumps({"done": []}), flush=True)
+'''
+        popen = subprocess.Popen
+
+        def start(command, **kwargs):
+            at = command.index("-m")
+            return popen([*command[:at], "-c", child], **kwargs)
+
+        with mock.patch.object(daemon.subprocess, "Popen", side_effect=start):
+            pool = daemon.Pool(cap=1, start=daemon.Worker)
+            script, environment = str(self.folder / "model.py"), dict(os.environ)
+            worker = pool.lease(script, environment)
+            self.addCleanup(worker.stop)
+            with self.assertRaises(daemon.WorkerGone) as caught:
+                worker.build({"op": "crash"}, lambda _frame: None)
+            detail = str(caught.exception)
+            self.assertIn("exited (1) during the build", detail)
+            self.assertIn("fault handler enabled: True", detail)
+            self.assertIn('File "<string>"', detail)
+            self.assertNotIn("discard-this-prefix", detail)
+            self.assertLess(len(detail), 17000)
+            # The observer extracts only the exit status, never the local stderr diagnostics.
+            from cadgen.engine.api import EngineError, _error
+
+            facts = {}
+            self.assertEqual(_error(EngineError(detail), [], facts)["frames"], [])
+            self.assertEqual(facts, {"died": 1})
+            pool.release(worker)
+            replacement = pool.lease(script, environment)
+            self.addCleanup(replacement.stop)
+            self.assertNotEqual(replacement.pid, worker.pid)
+            self.assertEqual(replacement.build({"op": "ok"}, lambda _frame: None), {"done": []})
+            pool.release(replacement)
 
 
 class ConnectTest(unittest.TestCase):
